@@ -18,7 +18,7 @@ SEARCH_RESULT_AGENT_PROMPT = """You are a visual retail search agent powered by 
 Your goal is to visually navigate to a retail search engine (such as Google Shopping or a major e-commerce marketplace), execute a search for the provided keyword, and inspect the top ranking competitor product listings.
 
 Instructions:
-1. Open the browser or navigate to `https://www.google.com/search?tbm=shop&q=<keyword>`.
+1. Navigate directly to a shopping search URL with the keyword encoded in the query string, such as `https://www.bing.com/shop?q=<keyword>` (or `https://www.google.com/search?tbm=shop&q=<keyword>`), rather than typing into a blank homepage.
 2. Observe the rendered search results page:
    - Identify top 3 to 5 organically ranking competitor product titles.
    - Note product title patterns, structure (e.g. `[Brand] [Gender] [Product Line] [Key Feature] [Color/Spec]`), and prominent attributes shown in listings.

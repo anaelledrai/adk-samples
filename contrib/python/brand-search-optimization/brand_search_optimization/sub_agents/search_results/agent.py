@@ -40,6 +40,8 @@ _TOOL_NAME_ALIASES: list[tuple[str, tuple[str, ...]]] = [
     ("scroll_at", ("scroll",)),
     ("current_state", ("take_screenshot",)),
     ("key_combination", ("press_key", "hotkey", "key_down", "key_up")),
+    ("wait_5_seconds", ("wait",)),
+    ("wait", ("wait_5_seconds",)),
 ]
 
 

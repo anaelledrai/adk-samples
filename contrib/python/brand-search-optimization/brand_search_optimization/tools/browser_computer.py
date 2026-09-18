@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import ipaddress
 import logging
 import re
@@ -213,8 +214,8 @@ class MockBrowserComputer(BaseComputer):
     # 1x1 transparent PNG image bytes
     MOCK_SCREENSHOT_BYTES: bytes = (
         b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06"
-        b"\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf"
-        b"\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
+        b"\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0cIDATx\x9cc`\x00\x02\x00\x00\x05"
+        b"\x00\x01z^\xab?\x00\x00\x00\x00IEND\xaeB`\x82"
     )
 
     def __init__(
@@ -336,6 +337,22 @@ class MockBrowserComputer(BaseComputer):
 class PlaywrightBrowserComputer(BaseComputer):
     """Controls a browser session using Playwright for Gemini Computer Use."""
 
+    _STEALTH_INIT_SCRIPT: str = """
+        delete Object.getPrototypeOf(navigator).webdriver;
+        window.chrome = {
+            runtime: {},
+            loadTimes: function() { return {}; },
+            csi: function() { return {}; },
+            app: {}
+        };
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5],
+        });
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en'],
+        });
+    """
+
     def __init__(
         self,
         screen_size: tuple[int, int] = DEFAULT_SCREEN_SIZE,
@@ -348,6 +365,7 @@ class PlaywrightBrowserComputer(BaseComputer):
         self._contexts: dict[str, Any] = {}
         self._pages: dict[str, Any] = {}
         self._current_session_id: str = "default"
+        self._last_search_query: str = "running shoes"
 
     async def prepare(self, tool_context: Any) -> None:
         """Binds active session context to avoid multi-session page contention."""
@@ -370,6 +388,71 @@ class PlaywrightBrowserComputer(BaseComputer):
     async def environment(self) -> ComputerEnvironment:
         return ComputerEnvironment.ENVIRONMENT_BROWSER
 
+    def _extract_query_from_url(self, url: str) -> str | None:
+        """Extracts search query parameter from a search or CAPTCHA redirect URL."""
+        try:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            if "continue" in params and params["continue"]:
+                inner_parsed = urllib.parse.urlparse(params["continue"][0])
+                inner_params = urllib.parse.parse_qs(inner_parsed.query)
+                for key in ("q", "k", "_nkw", "query"):
+                    if key in inner_params and inner_params[key]:
+                        return inner_params[key][0]
+            for key in ("q", "k", "_nkw", "query"):
+                if key in params and params[key]:
+                    return params[key][0]
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _is_bot_blocked_url(url: str) -> bool:
+        """Returns True if the URL indicates a CAPTCHA or automated bot block page."""
+        lower = url.lower()
+        return any(
+            marker in lower
+            for marker in (
+                "google.com/sorry",
+                "duckduckgo.com/static-pages/home-error",
+                "walmart.com/blocked",
+                "/captcha",
+                "418.html",
+            )
+        )
+
+    async def _recover_if_bot_blocked(
+        self, requested_url: str | None = None
+    ) -> None:
+        """Automatically redirects to Bing Shopping if a search engine blocks headless browsing."""
+        if not self._page or not isinstance(getattr(self._page, "url", None), str):
+            return
+        current = self._page.url
+        if not self._is_bot_blocked_url(current):
+            return
+        query = (
+            self._extract_query_from_url(current)
+            or (
+                self._extract_query_from_url(requested_url)
+                if requested_url
+                else None
+            )
+            or self._last_search_query
+        )
+        fallback_url = (
+            f"https://www.bing.com/shop?q={urllib.parse.quote_plus(query)}"
+        )
+        logger.info(
+            "Bot challenge detected at %s; transparently redirecting to %s",
+            current,
+            fallback_url,
+        )
+        try:
+            await self._page.goto(fallback_url, wait_until="domcontentloaded")
+            await asyncio.sleep(0.8)
+        except Exception as e:
+            logger.debug("Fallback navigation failed: %s", e)
+
     async def _ensure_browser(self) -> None:
         sid = self._current_session_id
         if sid not in self._pages or self._pages[sid] is None:
@@ -379,13 +462,22 @@ class PlaywrightBrowserComputer(BaseComputer):
                 if self._playwright is None:
                     self._playwright = await async_playwright().start()
                 if self._browser is None:
-                    self._browser = await self._playwright.chromium.launch(
-                        headless=self._headless,
-                        args=[
-                            "--disable-blink-features=AutomationControlled",
-                            "--no-sandbox",
-                        ],
-                    )
+                    launch_args = [
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-infobars",
+                    ]
+                    try:
+                        self._browser = await self._playwright.chromium.launch(
+                            channel="chrome",
+                            headless=self._headless,
+                            args=launch_args,
+                        )
+                    except Exception:
+                        self._browser = await self._playwright.chromium.launch(
+                            headless=self._headless,
+                            args=launch_args,
+                        )
                 if sid not in self._contexts or self._contexts[sid] is None:
                     context = await self._browser.new_context(
                         viewport={
@@ -397,10 +489,15 @@ class PlaywrightBrowserComputer(BaseComputer):
                             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                         ),
                         locale="en-US",
+                        extra_http_headers={
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                            "Sec-Ch-Ua-Mobile": "?0",
+                            "Sec-Ch-Ua-Platform": '"Linux"',
+                            "Upgrade-Insecure-Requests": "1",
+                        },
                     )
-                    await context.add_init_script(
-                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                    )
+                    await context.add_init_script(self._STEALTH_INIT_SCRIPT)
                     self._contexts[sid] = context
                 self._pages[sid] = await self._contexts[sid].new_page()
             except Exception as e:
@@ -414,7 +511,7 @@ class PlaywrightBrowserComputer(BaseComputer):
         if self._page and (
             not self._page.url or self._page.url == "about:blank"
         ):
-            target_url = _format_url("https://www.google.com")
+            target_url = _format_url("https://www.bing.com/shop")
             await self._page.goto(target_url, wait_until="domcontentloaded")
         return await self.current_state()
 
@@ -428,6 +525,7 @@ class PlaywrightBrowserComputer(BaseComputer):
                 )
             except Exception:
                 pass
+            await self._recover_if_bot_blocked()
         return await self.current_state()
 
     async def hover_at(self, x: int = 0, y: int = 0) -> ComputerState:
@@ -445,6 +543,8 @@ class PlaywrightBrowserComputer(BaseComputer):
         clear_before_typing: bool = True,
     ) -> ComputerState:
         await self._ensure_browser()
+        if text and text.strip():
+            self._last_search_query = text.strip()
         if self._page:
             if x is not None and y is not None:
                 await self._page.mouse.click(x, y)
@@ -460,6 +560,7 @@ class PlaywrightBrowserComputer(BaseComputer):
                     )
                 except Exception:
                     pass
+                await self._recover_if_bot_blocked()
         return await self.current_state()
 
     async def scroll_document(
@@ -516,7 +617,7 @@ class PlaywrightBrowserComputer(BaseComputer):
     async def search(self) -> ComputerState:
         await self._ensure_browser()
         if self._page:
-            target_url = _format_url(GOOGLE_SHOPPING_SEARCH_URL)
+            target_url = _format_url("https://www.bing.com/shop")
             await self._page.goto(
                 target_url,
                 wait_until="domcontentloaded",
@@ -536,9 +637,13 @@ class PlaywrightBrowserComputer(BaseComputer):
                 "Rejected navigation to disallowed URL: %s", formatted_url
             )
             return await self.current_state()
+        extracted_query = self._extract_query_from_url(formatted_url)
+        if extracted_query:
+            self._last_search_query = extracted_query
         await self._ensure_browser()
         if self._page:
             await self._page.goto(formatted_url, wait_until="domcontentloaded")
+            await self._recover_if_bot_blocked(formatted_url)
         return await self.current_state()
 
     async def key_combination(
@@ -548,6 +653,14 @@ class PlaywrightBrowserComputer(BaseComputer):
         combo = keys or ([key] if key else [])
         if self._page and combo:
             await self._page.keyboard.press("+".join(combo))
+            if any(k.lower() == "enter" for k in combo if k):
+                try:
+                    await self._page.wait_for_load_state(
+                        "domcontentloaded", timeout=DEFAULT_TIMEOUT_MS
+                    )
+                except Exception:
+                    pass
+                await self._recover_if_bot_blocked()
         return await self.current_state()
 
     async def drag_and_drop(
@@ -567,20 +680,45 @@ class PlaywrightBrowserComputer(BaseComputer):
 
     async def current_state(self) -> ComputerState:
         await self._ensure_browser()
+        current_url = "about:blank"
         if self._page:
+            current_url = self._page.url or "about:blank"
             try:
-                screenshot_bytes = await self._page.screenshot(type="png")
+                screenshot_bytes = await self._page.screenshot(
+                    type="png",
+                    animations="disabled",
+                    timeout=DEFAULT_TIMEOUT_MS,
+                )
                 return ComputerState(
                     screenshot=screenshot_bytes,
-                    url=self._page.url or "about:blank",
+                    url=self._page.url or current_url,
                 )
             except Exception as e:
-                logger.warning(
-                    "Screenshot capture failed (%s); using fallback bytes", e
+                logger.debug(
+                    "Standard screenshot timed out or failed (%s); attempting CDP capture",
+                    e,
                 )
+                try:
+                    cdp = await self._page.context.new_cdp_session(self._page)
+                    try:
+                        res = await cdp.send(
+                            "Page.captureScreenshot", {"format": "png"}
+                        )
+                        screenshot_bytes = base64.b64decode(res["data"])
+                        return ComputerState(
+                            screenshot=screenshot_bytes,
+                            url=self._page.url or current_url,
+                        )
+                    finally:
+                        await cdp.detach()
+                except Exception as cdp_err:
+                    logger.warning(
+                        "Screenshot capture failed (%s); using fallback bytes",
+                        cdp_err,
+                    )
         return ComputerState(
             screenshot=MockBrowserComputer.MOCK_SCREENSHOT_BYTES,
-            url="about:blank",
+            url=current_url,
         )
 
     async def close(self) -> None:
